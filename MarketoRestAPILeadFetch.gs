@@ -16,7 +16,7 @@
 // Marketo API Credentials
 var CLIENT_ID = '<YOUR CLIENT ID>';
 var CLIENT_SECRET = '<YOUR CLIENT SECRET>';
-var MUNCHKIN_ID = '<YOUR MUNCHKIN ID>';
+var MUNCHKIN_ID = '<YOUR MUNCHKIN_ID>';
 
 // Function to Get Access Token
 function getAccessToken() {
