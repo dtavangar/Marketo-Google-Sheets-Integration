@@ -51,7 +51,7 @@ This project is licensed under the **GPLv3 License**.
 
 ## Version
 
-**Version**: 1.1  
+**Version**: 1.2  
 **Status**: Beta  
 
 ---
