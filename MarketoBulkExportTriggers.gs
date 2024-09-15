@@ -13,21 +13,20 @@
  * License: GPLv3 License
  */
 
-
-// Function to create a trigger for running the export job every minute
-function createOneMinuteTriggerForJobCreation() {
-  // Create a trigger to run every 1 minute
+// Function to create a trigger for running the export job every 5 minutes
+function createFiveMinuteTriggerForJobCreation() {
+  // Create a trigger to run every 5 minutes
   ScriptApp.newTrigger('runBulkExportInChunks')
     .timeBased()
-    .everyMinutes(1) // Set to run every 1 minute
+    .everyMinutes(5) // Set to run every 5 minutes
     .create();
 }
 
-// Function to create a trigger for checking the export job status every 10 minutes
-function createTenMinuteTriggerForStatusCheck() {
-  // Create a trigger to run every 10 minutes
+// Function to create a trigger for checking the export job status every 15 minutes
+function createFifteenMinuteTriggerForStatusCheck() {
+  // Create a trigger to run every 15 minutes
   ScriptApp.newTrigger('checkBulkExportStatusAndDownload')
     .timeBased()
-    .everyMinutes(10) // Set to run every 10 minutes
+    .everyMinutes(15) // Set to run every 15 minutes
     .create();
 }
