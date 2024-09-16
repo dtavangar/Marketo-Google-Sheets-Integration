@@ -1,260 +1,179 @@
 /**
- * Marketo Bulk Extract to Google Sheets Script
+ * Marketo Bulk Extract Script with UID Tracking and Date Optimization
  * 
- * This script automates the export of leads data from Marketo to Google Sheets 
- * using the Marketo Bulk API. It runs in chunks based on a date range, checks the 
- * status of export jobs, and ensures that duplicate data is not processed across 
- * script executions.
+ * Description:
+ * This script leverages Marketo's Bulk Extract API to incrementally export lead data into Google Sheets,
+ * ensuring that previously downloaded records are not re-downloaded. It tracks the highest lead UID (Marketo ID)
+ * and uses that as a checkpoint for the next download, ensuring data consistency across runs.
  * 
- * Key Features:
- * - Fetches leads data in chunks (31-day chunks in this case)
- * - Saves and resumes the last processed date to avoid duplicate processing
- * - Handles API retries for export jobs not found (404 errors)
- * - Writes the leads data to Google Sheets while skipping duplicates
+ * The script has been optimized to process lead data in 31-day chunks, respecting the Marketo Bulk Export API's 
+ * 31-day limit on the `createdAt` filter and ensuring no more than 10 jobs are queued at a time.
  * 
  * Author: Damon Tavangar
  * Email: tavangar2017@gmail.com
  * 
- * Version: 1.2
+ * Version: 1.3
  * License: GPL License
  */
-
 
 // Marketo API Credentials
 var CLIENT_ID = '<YOUR CLIENT ID>';
 var CLIENT_SECRET = '<YOUR CLIENT SECRET>';
 var MUNCHKIN_ID = '<YOUR MUNCHKIN_ID>';
-var SHEET_ID = "<GOOGLE SHEET ID>"; // Define the sheet ID here
-var chunkSize = 31; // 31-day chunks
+var SHEET_ID = "<GOOGLE SHEET ID>"; // Define the Google Sheet ID here
+var chunkSize = 31; // Marketo API limit of 31 fields per bulk request
 
-// Main function to run bulk export in chunks
+/**
+ * Main function to run bulk export in chunks.
+ * This function orchestrates the entire export process, checking for queued jobs, creating new export jobs,
+ * and ensuring data continuity by using the latest UID and `createdAt` date from Google Sheets.
+ * 
+ * The function ensures that only up to 10 jobs are queued at any time and splits the lead data into 
+ * 31-day `createdAt` chunks to avoid hitting Marketo's 31-day filter limitation.
+ */
 function runBulkExportInChunks() {
   var properties = PropertiesService.getScriptProperties();
-  var startTime = new Date().getTime();
-  
-  // Retrieve the last processed date from properties, or set to the earliest date
-  var lastProcessedDate = properties.getProperty('lastProcessedDate');
-  var startDate = lastProcessedDate ? new Date(lastProcessedDate) : new Date('2021-06-20T00:00:00Z');
-  var endDate = new Date('2024-12-12T00:00:00Z');
-  var token = getAccessToken();
+  var startTime = new Date().getTime(); // Track start time to manage script timeout
+  var lastMaxUID = properties.getProperty('lastMaxUID'); // Retrieve last max UID from stored properties
+  var startUID = lastMaxUID ? parseInt(lastMaxUID, 10) : 0; // Start at 0 if no UID is stored
+  var token = getAccessToken(); // Fetch access token from Marketo
+  var latestCreatedAt = getLatestCreatedAtFromSheet(); // Get the latest `createdAt` from Google Sheets
 
-  while (startDate < endDate) {
-    var currentEndDate = new Date(startDate);
-    currentEndDate.setDate(currentEndDate.getDate() + chunkSize - 1);
+  Logger.log("Processing chunk starting from UID: " + startUID);
 
-    if (currentEndDate > endDate) {
-      currentEndDate = endDate;
-    }
+  // Process data in 31-day chunks until we've reached the present
+  var success = createBulkExportJobForUIDRange(startUID, latestCreatedAt, token);
 
-    var formattedStartAt = startDate.toISOString().split('.')[0] + "Z";
-    var formattedEndAt = currentEndDate.toISOString().split('.')[0] + "Z";
-
-    Logger.log("Processing chunk from: " + formattedStartAt + " to: " + formattedEndAt);
-
-    // Check queued jobs and stop if limit exceeded
-    if (getNumberOfQueuedJobs(token) >= 10) {
-      Logger.log('Too many jobs in queue, stopping execution. Will resume in the next run.');
-      return;
-    }
-
-    var success = createBulkExportJobForDateRange(formattedStartAt, formattedEndAt, token);
-
-    if (!success) {
-      Logger.log('Error occurred, stopping execution.');
-      return;
-    }
-
-    // Retrieve leads data from the export job and pass it to getLatestCreatedAtFromChunk
-    var exportId = getExportIdFromJob(token); // Get the exportId from the job created
-    if (exportId) {
-      var leadsData = retrieveLeadsFromExportJob(token, exportId); // Fetch the leads from the export job
-      if (leadsData && leadsData.result) {
-        var latestCreatedAt = getLatestCreatedAtFromChunk(leadsData);
-        if (latestCreatedAt) {
-          properties.setProperty('lastProcessedDate', latestCreatedAt);
-        } else {
-          Logger.log('No leads found in the chunk, skipping lastProcessedDate update.');
-        }
-      } else {
-        Logger.log('Error retrieving leads data, skipping lastProcessedDate update.');
-      }
-    } else {
-      Logger.log('Export ID is null, skipping lastProcessedDate update.');
-    }
-
-    startDate.setDate(startDate.getDate() + chunkSize);
-
-    var elapsedTime = (new Date().getTime() - startTime) / 1000; // in seconds
-    if (elapsedTime > 300) {
-      Logger.log('Stopping script to avoid timeout, will resume with the next chunk.');
-      return;
-    }
+  if (!success) {
+    Logger.log('Error occurred, stopping execution.');
+    return;
   }
 
-  properties.deleteProperty('lastProcessedDate');
   Logger.log('All chunks processed successfully.');
 }
 
-// Function to retrieve leads from the export job
-function retrieveLeadsFromExportJob(token, exportId) {
-  var url = 'https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export/' + exportId + '/file.json?access_token=' + token;
-  var retries = 3;
+/**
+ * Function to get the latest `createdAt` timestamp from Google Sheets.
+ * This function scans the Google Sheet for the latest `createdAt` date, so the script can filter the export
+ * to only include leads created after the last export.
+ * 
+ * @return {Date|null} - Returns the latest `createdAt` timestamp or null if no data is available.
+ */
+function getLatestCreatedAtFromSheet() {
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getActiveSheet();
+  var lastRow = sheet.getLastRow();
 
-  for (var attempt = 0; attempt < retries; attempt++) {
-    try {
-      var response = UrlFetchApp.fetch(url);
-      var csvContent = response.getContentText();
-      return Utilities.parseCsv(csvContent);
-    } catch (e) {
-      if (e.message.includes("404")) {
-        Logger.log('Export job not found (404), retrying in 2 seconds.');
-        Utilities.sleep(2000); // Wait before retrying
-      } else {
-        Logger.log('Error occurred: ' + e.message);
-        throw e;
-      }
-    }
-  }
-
-  Logger.log('Failed after 3 retries, export job not found.');
-  return null; // If all retries fail, return null
-}
-
-
-
-
-// Function to get exportId from the latest created export job
-function getExportIdFromJob(token) {
-  var url = 'https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export.json?access_token=' + token;
-  var response = UrlFetchApp.fetch(url);
-  var jsonResponse = JSON.parse(response.getContentText());
-
-  if (jsonResponse.success) {
-    // Assuming the latest export job is the last one in the list
-    var exportJobs = jsonResponse.result;
-    if (exportJobs.length > 0) {
-      var latestJob = exportJobs[exportJobs.length - 1]; // Get the most recent job
-      return latestJob.exportId;
-    } else {
-      Logger.log('No export jobs found.');
-      return null;
-    }
-  } else {
-    Logger.log('Error fetching export jobs: ' + jsonResponse.errors[0].message);
-    return null;
-  }
-}
-
-// Function to clear all properties
-function clearAllProperties() {
-  var properties = PropertiesService.getScriptProperties();
-  properties.deleteAllProperties();
-  Logger.log('All script properties cleared.');
-}
-
-// Function to get the latest createdAt date from the chunk
-function getLatestCreatedAtFromChunk(apiResponse) {
-  var leads = apiResponse.result; // Accessing the leads data from the API response
-
-  // If there are no leads, return null or some default value
-  if (leads.length === 0) {
+  if (lastRow < 2) { // No data or only header is present
+    Logger.log('Google Sheet is empty or contains only headers, no date filter will be applied.');
     return null;
   }
 
-  // Initialize the latest createdAt as the first lead's createdAt
-  var latestCreatedAt = leads[0].createdAt;
+  var createdAtColumn = sheet.getRange(2, 3, lastRow - 1, 1).getValues(); // Assuming `createdAt` is in column 3
+  var latestCreatedAt = new Date(Math.max.apply(null, createdAtColumn.map(function(row) {
+    return new Date(row[0]).getTime(); // Convert date strings to timestamps
+  })));
 
-  // Iterate through the leads and find the latest createdAt date
-  for (var i = 1; i < leads.length; i++) {
-    if (new Date(leads[i].createdAt) > new Date(latestCreatedAt)) {
-      latestCreatedAt = leads[i].createdAt;
-    }
-  }
+  // Increment by 1 second to avoid re-downloading the last record
+  latestCreatedAt.setSeconds(latestCreatedAt.getSeconds() + 1);
 
-  Logger.log("Latest createdAt from chunk: " + latestCreatedAt);
+  Logger.log('Latest `createdAt` date found: ' + latestCreatedAt.toISOString());
   return latestCreatedAt;
 }
 
-// Function to check the number of queued jobs
-function getNumberOfQueuedJobs(token) {
-  var url = 'https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export.json?access_token=' + token;
-  
-  var response = UrlFetchApp.fetch(url);
-  var jsonResponse = JSON.parse(response.getContentText());
-
-  if (jsonResponse.success) {
-    var queuedJobs = jsonResponse.result.filter(function(job) {
-      return job.status === 'Queued' || job.status === 'Processing';
-    });
-
-    Logger.log('Number of queued jobs: ' + queuedJobs.length);
-    return queuedJobs.length;
-  } else {
-    Logger.log('Error fetching export jobs: ' + jsonResponse.errors[0].message);
-    return 0;
-  }
-}
-
-// Function to create the bulk export job for the given date range
-function createBulkExportJobForDateRange(startAt, endAt, token) {
+/**
+ * Function to create the bulk export job for a range of UIDs.
+ * This function creates jobs using the Marketo API, splitting the `createdAt` date range into chunks
+ * to respect Marketo's 31-day limit, and ensuring no more than 10 jobs are queued at a time.
+ * 
+ * @param {number} startUID - The starting UID for the export.
+ * @param {Date|null} latestCreatedAt - The latest `createdAt` timestamp from the Google Sheet, if available.
+ * @param {string} token - The Marketo access token.
+ * @return {boolean} - Returns true if the job is successfully created, otherwise false.
+ */
+function createBulkExportJobForUIDRange(startUID, latestCreatedAt, token) {
   var url = 'https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export/create.json?access_token=' + token;
 
-  var payload = {
-    "format": "CSV",
-    "filter": {
+  // If no `createdAt` timestamp is available, start from the beginning
+  var startAt = latestCreatedAt ? latestCreatedAt : new Date(0); // Default to epoch if no timestamp
+  var currentDate = new Date(); // Get current date for end range
+  var queuedJobs = 0; // Track the number of jobs created in this run
+
+  while (startAt < currentDate) {
+    // Calculate the next end date chunk (31 days from the start date or current date)
+    var endAt = new Date(startAt);
+    endAt.setDate(endAt.getDate() + 31); // Add 31 days to start date
+    if (endAt > currentDate) {
+      endAt = currentDate; // Make sure we don't exceed the current date
+    }
+
+    // Check if we have space for more jobs in the queue (limit to 10)
+    if (!checkJobQueueCapacity(token) || queuedJobs >= 10) {
+      Logger.log('Too many jobs already created, stopping further job creation.');
+      return false; // Stop if we've reached the limit of 10 jobs
+    }
+
+    // Build the filter with the `createdAt` range
+    var filter = {
+      "id": {
+        "$gt": startUID // Fetch records with UIDs greater than the last processed UID
+      },
       "createdAt": {
-        "startAt": startAt,
-        "endAt": endAt
+        "startAt": startAt.toISOString(), // Leads created after the last lead
+        "endAt": endAt.toISOString()      // Up to the end of the 31-day chunk
       }
-    },
-    "fields": ["id", "email", "createdAt", "updatedAt"]
-  };
+    };
 
-  var options = {
-    'method': 'post',
-    'contentType': 'application/json',
-    'payload': JSON.stringify(payload)
-  };
+    var payload = {
+      "format": "CSV",
+      "filter": filter,
+      "fields": ["id", "email", "createdAt", "updatedAt"],
+      "batchSize": chunkSize // Limit batch size to 31 (Marketo limit)
+    };
 
-  try {
-    var response = UrlFetchApp.fetch(url, options);
-    var jsonResponse = JSON.parse(response.getContentText());
+    var options = {
+      'method': 'post',
+      'contentType': 'application/json',
+      'payload': JSON.stringify(payload)
+    };
 
-    if (jsonResponse.success) {
-      var exportId = jsonResponse.result[0].exportId;
-      Logger.log('Bulk Export Job Created with exportId: ' + exportId);
-      enqueueBulkExportJob(exportId, token);
-      
-      // Save the export ID for later status checks
-      saveExportId(exportId);
-      
-      return true;
-    } else {
-      Logger.log('Error creating bulk export job: ' + jsonResponse.errors[0].message);
+    try {
+      var response = UrlFetchApp.fetch(url, options);
+      var jsonResponse = JSON.parse(response.getContentText());
+
+      if (jsonResponse.success) {
+        var exportId = jsonResponse.result[0].exportId;
+        Logger.log('Bulk Export Job Created with exportId: ' + exportId);
+        enqueueBulkExportJob(exportId, token); // Enqueue the job after creation
+
+        // Save the export ID for later status checks
+        saveExportId(exportId);
+
+        queuedJobs++; // Increment the number of jobs created in this run
+      } else {
+        Logger.log('Error creating bulk export job: ' + jsonResponse.errors[0].message);
+        return false;
+      }
+    } catch (e) {
+      Logger.log('Exception occurred while creating the export job: ' + e.message);
       return false;
     }
-  } catch (e) {
-    Logger.log('Exception occurred while creating the export job: ' + e.message);
-    return false;
-  }
-}
 
-// Function to save exportId for later status checks
-function saveExportId(exportId) {
-  var properties = PropertiesService.getScriptProperties();
-  var exportIds = properties.getProperty('exportIds');
+    // Move the `startAt` forward by 31 days for the next chunk
+    startAt = endAt;
+  }
   
-  if (exportIds) {
-    exportIds = JSON.parse(exportIds);
-  } else {
-    exportIds = [];
-  }
-
-  exportIds.push(exportId);
-  properties.setProperty('exportIds', JSON.stringify(exportIds));
+  return true;
 }
 
-// Function to enqueue the export job
+/**
+ * Function to enqueue the export job.
+ * This function enqueues a created export job using the Marketo API.
+ * If there are too many jobs in the queue, it will log the error and stop the process.
+ * 
+ * @param {string} exportId - The ID of the export job.
+ * @param {string} token - The Marketo access token.
+ * @return {boolean} - Returns true if the job was enqueued successfully, false otherwise.
+ */
 function enqueueBulkExportJob(exportId, token) {
   var url = 'https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export/' + exportId + '/enqueue.json?access_token=' + token;
 
@@ -269,15 +188,22 @@ function enqueueBulkExportJob(exportId, token) {
 
     if (jsonResponse.success) {
       Logger.log('Bulk Export Job Enqueued: ' + exportId);
+      return true;
     } else {
       Logger.log('Error enqueuing bulk export job: ' + jsonResponse.errors[0].message);
+      return false;
     }
   } catch (e) {
     Logger.log('Exception occurred while enqueuing the export job: ' + e.message);
+    return false;
   }
 }
 
-// Function to check the status of export jobs and download the completed ones
+/**
+ * Function to check the status of export jobs and download the completed ones.
+ * This function loops through all previously created export jobs, checks their status, and downloads the results
+ * if the job is completed.
+ */
 function checkBulkExportStatusAndDownload() {
   var properties = PropertiesService.getScriptProperties();
   var exportIds = properties.getProperty('exportIds');
@@ -290,7 +216,6 @@ function checkBulkExportStatusAndDownload() {
   }
 
   var token = getAccessToken();
-  var completedJobs = [];
 
   for (var i = 0; i < exportIds.length; i++) {
     var exportId = exportIds[i];
@@ -305,24 +230,20 @@ function checkBulkExportStatusAndDownload() {
         Logger.log('Export Job Status for ' + exportId + ': ' + status);
 
         if (status === 'Completed') {
-          downloadBulkExtractToGoogleSheets(exportId, token);
-          
-          // Ensure there was actual lead data before removing from exportIds
-          var fileContent = UrlFetchApp.fetch('https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export/' + exportId + '/file.json?access_token=' + token).getContentText();
-          var fileRows = Utilities.parseCsv(fileContent);
-          if (fileRows.length > 1) {
-            completedJobs.push(exportId); // Add to completedJobs list only if data was found
-          } else {
-            Logger.log('Job ' + exportId + ' completed but no lead data found.');
-          }
+          downloadBulkExtractToGoogleSheets(exportId, token); // Download and write to Google Sheets
+          // Remove completed job from the list
+          exportIds.splice(i, 1);
+          i--; // Adjust loop index after removing
         } else if (status === 'Queued' || status === 'Processing') {
           Logger.log('Job ' + exportId + ' is still in progress, will check again in the next scheduled execution.');
         }
       } else {
         Logger.log('Error checking export job status: ' + jsonResponse.errors[0].message);
         if (jsonResponse.errors[0].message.includes("not found")) {
+          // If the job is not found, log it and remove it from the list
           Logger.log('Export job ' + exportId + ' not found, removing from the list.');
-          completedJobs.push(exportId); // Add to completedJobs if job not found
+          exportIds.splice(i, 1);  // Remove from the list
+          i--; // Adjust the loop index
         }
       }
     } catch (e) {
@@ -330,128 +251,162 @@ function checkBulkExportStatusAndDownload() {
     }
   }
 
-  // Remove completed jobs from the exportIds list
-  exportIds = exportIds.filter(id => !completedJobs.includes(id));
+  // Save updated list of export IDs
   properties.setProperty('exportIds', JSON.stringify(exportIds));
-
-  Logger.log('Remaining jobs: ' + exportIds.length);
-  Logger.log('API Call made at: ' + new Date().toISOString());
-
 }
 
-// Function to download and save the bulk extract to Google Sheets
+/**
+ * Function to download and save the bulk extract to Google Sheets.
+ * This function downloads the results of a completed export job and writes the data into Google Sheets.
+ * 
+ * @param {string} exportId - The ID of the export job.
+ * @param {string} token - The Marketo access token.
+ */
 function downloadBulkExtractToGoogleSheets(exportId, token) {
   var url = 'https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export/' + exportId + '/file.json?access_token=' + token;
 
   try {
     var response = UrlFetchApp.fetch(url);
     var csvContent = response.getContentText();
-    var rows = Utilities.parseCsv(csvContent);
-
-    // If there is no data or only headers, log it and stop processing
-    if (rows.length <= 1 || rows[1].length === 0) {
-      Logger.log('No lead data found for exportId ' + exportId + ', only headers returned.');
-      return;
-    }
-
-    Logger.log('Bulk Extract File Content: ' + csvContent);
     
-    // Process the CSV and write it to Google Sheets
-    var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-    var properties = PropertiesService.getScriptProperties();
-    
-    // Track existing IDs in the Google Sheet to avoid duplicates across runs
-    var existingIds = new Set();
-    var lastRow = sheet.getLastRow();
+    if (response.getResponseCode() === 200) {
+      Logger.log('Bulk Extract File Content: ' + csvContent);
+      
+      // Process the CSV and write it to Google Sheets
+      var sheet = SpreadsheetApp.openById(SHEET_ID).getActiveSheet(); // Use the provided sheet ID
+      var rows = Utilities.parseCsv(csvContent);
 
-    // Retrieve the last processed ID from properties to avoid duplicates across script runs
-    var lastProcessedId = properties.getProperty('lastProcessedId');
-    
-    if (lastRow > 0) {
-      var idColumn = sheet.getRange(2, 1, lastRow - 1, 1).getValues(); // Assuming ID is in the first column
-      for (var i = 0; i < idColumn.length; i++) {
-        existingIds.add(idColumn[i][0]); // Add all existing IDs to the set
-      }
-    }
+      var lastRow = sheet.getLastRow();
+      var headersExist = lastRow > 0;
 
-    // Append rows with unique IDs only
-    for (var i = 0; i < rows.length; i++) {
-      if (i === 0 && lastRow > 0) {
-        // Skip header row if already exists
-        continue;
+      // Collect existing IDs in advance (instead of checking one by one)
+      var existingIds = new Set();
+      if (lastRow > 1) {
+        var idColumn = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+        for (var i = 0; i < idColumn.length; i++) {
+          existingIds.add(idColumn[i][0]);
+        }
       }
 
-      var recordId = rows[i][0]; // Assuming ID is in the first column
-      // Skip if ID is already processed or equals the last processed ID
-      if (!existingIds.has(recordId) && recordId > lastProcessedId) {
-        sheet.appendRow(rows[i]); // Append only if the ID is unique
-        existingIds.add(recordId); // Add the new ID to the set
-      } else {
-        Logger.log('Skipping duplicate or already processed record with ID: ' + recordId);
+      // Write headers if they don't exist
+      if (!headersExist && rows.length > 0) {
+        sheet.appendRow(rows[0]); // Write headers
       }
-    }
 
-    // Update the last processed ID to persist across script runs
-    var latestProcessedId = rows[rows.length - 1][0]; // Assuming ID is in the first column
-    properties.setProperty('lastProcessedId', latestProcessedId);
-    
-    Logger.log('Data written to Google Sheets successfully.');
+      // Collect new rows to batch insert
+      var newRows = [];
+      var maxUID = 0;
+
+      for (var i = 1; i < rows.length; i++) {
+        var recordId = parseInt(rows[i][0], 10);
+        if (!existingIds.has(recordId)) {
+          newRows.push(rows[i]); // Collect the new row
+          existingIds.add(recordId); // Track the new ID
+          if (recordId > maxUID) {
+            maxUID = recordId; // Update max UID
+          }
+        } else {
+          Logger.log('Skipping duplicate record with ID: ' + recordId);
+        }
+      }
+
+      if (newRows.length > 0) {
+        sheet.getRange(lastRow + 1, 1, newRows.length, newRows[0].length).setValues(newRows); // Batch insert
+      }
+
+      // Update the last max UID property
+      if (maxUID > 0) {
+        PropertiesService.getScriptProperties().setProperty('lastMaxUID', maxUID);
+      }
+
+      Logger.log('Data written to Google Sheets successfully.');
+
+    } else {
+      Logger.log('Error downloading bulk extract file: ' + response.getContentText());
+    }
   } catch (e) {
     Logger.log('Exception occurred while downloading the bulk extract: ' + e.message);
   }
 }
 
+/**
+ * Function to get access token from Marketo.
+ * This function fetches the OAuth access token required to authenticate API requests to Marketo.
+ * 
+ * @return {string} - The OAuth access token.
+ */
+function getAccessToken() {
+  var tokenUrl = 'https://' + MUNCHKIN_ID + '.mktorest.com/identity/oauth/token?grant_type=client_credentials&client_id=' + CLIENT_ID + '&client_secret=' + CLIENT_SECRET;
 
-// Function to get last processed CreatedAt date from Google Sheets
-function getLastProcessedCreatedAtDate() {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  var lastRow = sheet.getLastRow();
-  
-  if (lastRow > 1) { // Assuming first row is headers
-    var lastDate = sheet.getRange(lastRow, 3).getValue(); // Assuming createdAt is in the third column
-    if (lastDate) {
-      return new Date(lastDate).toISOString().split('.')[0] + "Z";
+  try {
+    var response = UrlFetchApp.fetch(tokenUrl);
+    var jsonResponse = JSON.parse(response.getContentText());
+
+    if (jsonResponse.access_token) {
+      Logger.log('Access token retrieved successfully.');
+      return jsonResponse.access_token;
+    } else {
+      Logger.log('Error retrieving access token: ' + jsonResponse.error_description);
+      throw new Error('Failed to retrieve access token');
     }
+  } catch (e) {
+    Logger.log('Error fetching access token, retrying: ' + e.message);
+    Utilities.sleep(2000); // Retry after 2 seconds
+    return getAccessToken(); // Retry logic (consider adding a retry count to prevent infinite loops)
   }
-  
-  return null; // No previous data or no valid date found
 }
 
-// Function to get access token from Marketo
-function getAccessToken() {
-  var properties = PropertiesService.getScriptProperties();
-  var tokenInfo = properties.getProperty('tokenInfo');
+/**
+ * Function to check the number of queued jobs.
+ * This function uses the Marketo API to check the number of currently queued or processing jobs.
+ * If there are too many jobs (>=10), it will return false, indicating that no new jobs should be enqueued.
+ * 
+ * @param {string} token - The Marketo access token.
+ * @return {boolean} - Returns true if there is space for more jobs, false if the queue is full (>= 10 jobs).
+ */
+function checkJobQueueCapacity(token) {
+  var url = 'https://' + MUNCHKIN_ID + '.mktorest.com/bulk/v1/leads/export.json?access_token=' + token;
 
-  if (tokenInfo) {
-    tokenInfo = JSON.parse(tokenInfo);
-
-    // Check if the token is still valid
-    var now = new Date().getTime();
-    if (now < tokenInfo.expires_at) {
-      Logger.log('Using cached access token.');
-      return tokenInfo.access_token;
-    }
-  }
-
-  // If no token or expired, fetch a new one
-  var tokenUrl = 'https://' + MUNCHKIN_ID + '.mktorest.com/identity/oauth/token?grant_type=client_credentials&client_id=' + CLIENT_ID + '&client_secret=' + CLIENT_SECRET;
-  
-  var response = UrlFetchApp.fetch(tokenUrl);
+  var response = UrlFetchApp.fetch(url);
   var jsonResponse = JSON.parse(response.getContentText());
 
-  if (jsonResponse.access_token) {
-    Logger.log('Access token retrieved successfully.');
+  if (jsonResponse.success) {
+    var queuedJobs = jsonResponse.result.filter(function(job) {
+      return job.status === 'Queued' || job.status === 'Processing';
+    });
 
-    // Cache the token with its expiration time (assume 1 hour)
-    var expiresAt = new Date().getTime() + (jsonResponse.expires_in * 1000);
-    properties.setProperty('tokenInfo', JSON.stringify({
-      access_token: jsonResponse.access_token,
-      expires_at: expiresAt
-    }));
+    Logger.log('Number of queued jobs: ' + queuedJobs.length);
 
-    return jsonResponse.access_token;
+    // If there are 10 or more jobs, return false (queue is full)
+    if (queuedJobs.length >= 10) {
+      Logger.log('Too many jobs in the queue, stopping job creation.');
+      return false;
+    }
+
+    // Otherwise, return true (there is capacity for more jobs)
+    return true;
   } else {
-    Logger.log('Error retrieving access token: ' + jsonResponse.error_description);
-    throw new Error('Failed to retrieve access token');
+    Logger.log('Error fetching export jobs: ' + jsonResponse.errors[0].message);
+    return false; // Return false in case of error
   }
+}
+
+/**
+ * Function to save the exportId for later status checks.
+ * The function saves the exportId in the script's properties so that the status can be checked later.
+ * 
+ * @param {string} exportId - The ID of the export job.
+ */
+function saveExportId(exportId) {
+  var properties = PropertiesService.getScriptProperties();
+  var exportIds = properties.getProperty('exportIds');
+
+  if (exportIds) {
+    exportIds = JSON.parse(exportIds);
+  } else {
+    exportIds = [];
+  }
+
+  exportIds.push(exportId);
+  properties.setProperty('exportIds', JSON.stringify(exportIds));
 }
